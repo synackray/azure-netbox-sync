@@ -1,0 +1,65 @@
+# Azure NetBox Sync
+
+Exports Azure objects using the [Azure SDK for Python](https://docs.microsoft.com/en-us/python/api/?view=azure-python), transforms them into NetBox objects, and syncs them.
+
+## Principles
+
+The [NetBox documentation](https://netbox.readthedocs.io/en/stable/#serve-as-a-source-of-truth) makes it clear the tool is intended to act as a "Source of Truth". The automated import of live network state is strongly discouraged. While this is sound logic we've aimed to provide a middle-ground solution for those who desire the functionality.
+
+All objects collected from Azure have a "lifecycle". Upon import, for supported object types, they are tagged "Synced" and "Azure" to note their origin and distinguish them from other objects. Using this tagging system also allows for the orphaning of objects which are no longer detected in Azure. This ensures stale objects are removed from NetBox keeping an accurate current state.
+
+## Object Codex
+
+The following objects are tracked and synced between Azure and NetBox. Object types which support tags are also eligible to be pruned.
+
+| Azure            | NetBox                                     | Supports Tags |
+|------------------|--------------------------------------------|---------------|
+| Subnets          | Prefixes                                   | Yes           |
+| Virtual Machines | Interfaces, IP Addresses, Virtual Machines | Yes           |
+| Virtual Networks | Prefixes                                   | Yes           |
+
+## Requirements
+
+The following minimum software versions have been tested for compatibility.
+
+* Azure SDK for Python against Azure API version 2019-07-01
+* NetBox v2.6.7
+
+The following permissions are required for this script to function.
+* Microsoft Azure - Service principle with global read-only permissions.
+* NetBox - API token with "write enabled" permissions. Instructions are available in the [NetBox documentation](https://netbox.readthedocs.io/en/stable/api/authentication/).
+
+## Installation
+
+1. Clone the repository.
+2. Create a Python Virtual Environment [(venv)](https://docs.python.org/3/library/venv.html) and activate it.
+3. Install the package requirements by running `pip install -r requirements.txt`.
+4. Copy the `settings.example.py` to `settings.py` and fill in the values.
+5. Execute `run.py`.
+6. [optional] Schedule a cron job to execute the script on a regular basis.
+
+## Examples
+
+### Help Menu
+
+```
+$ run.py -h
+usage: run.py [-h] [-c] [-v]
+
+optional arguments:
+  -h, --help     show this help message and exit
+  -c, --cleanup  Remove all Azure synced objects which support tagging. This
+                 is helpful if you want to start fresh or stop using this
+                 script.
+  -v, --verbose  Enable verbose output. This overrides the log level in the
+                 settings file. Intended for debugging purposes only.
+```
+
+### Cron Job
+
+The following job runs every 4 hours at minute 15. The full paths to python and the script are provided so that the virtual environment instance and packages are used.
+
+```
+# Azure to NetBox Sync
+15 */4 * * * /opt/azure-netbox-sync/bin/python /opt/azure-netbox-sync/run.py >/dev/null 2>&1
+```
