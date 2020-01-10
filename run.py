@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exports Azure objects and imports them into Netbox via Python3"""
+"""Collects Azure resources and syncs them to Netbox via Python3"""
 
 from azure.common.credentials import ServicePrincipalCredentials
 from azure.mgmt.network import NetworkManagementClient
@@ -7,20 +7,137 @@ from azure.mgmt.resource import SubscriptionClient
 from azure.mgmt.compute import ComputeManagementClient
 from msrestazure import azure_exceptions
 import settings
+from logger import log
 
 
-def find_resource_name(resource_id, resource_type):
+def compare_dicts(dict1, dict2, dict1_name="d1", dict2_name="d2", path=""):
     """
-    Determine an Azure resource name by parsing its resource ID.
+    Compares the key value pairs of two dictionaries and match boolean.
 
-    resource_id = String of URI path for the resource ID
-    resource_type = String of the Azure resource type
-    returns string
+    dict1 keys and values are compared against dict2. dict2 may have keys and
+    values that dict1 does not care evaluate.
+    dict1_name and dict2_name allow you to overwrite dictionary name for logs.
     """
-    resource_id = resource_id.split("/")
-    resource_type_index = resource_id.index(resource_type)
-    return resource_id[resource_type_index+1]
+    # Setup paths to track key exploration. The path parameter is used to allow
+    # recursive comparisions and track what's being compared.
+    result = False
+    for key in dict1.keys():
+        dict1_path = "{}{}[{}]".format(dict1_name, path, key)
+        dict2_path = "{}{}[{}]".format(dict2_name, path, key)
+        if key not in dict2.keys():
+            log.debug("%s not a valid key in %s.", dict1_path, dict2_path)
+        elif isinstance(dict1[key], dict) and isinstance(dict2[key], dict):
+            log.debug(
+                "%s and %s contain dictionary. Evaluating.", dict1_path,
+                dict2_path
+                )
+            compare_dicts(
+                dict1[key], dict2[key], dict1_name, dict2_name,
+                path="[{}]".format(key)
+                )
+        elif isinstance(dict1[key], list) and isinstance(dict2[key], list):
+            log.debug(
+                "%s and %s key '%s' contains list. Validating dict1 items "
+                "exist in dict2.", dict1_path, dict2_path, key
+                )
+            if not all([bool(item in dict2[key]) for item in dict1[key]]):
+                log.debug(
+                    "Mismatch: %s value is '%s' while %s value is '%s'.",
+                    dict1_path, dict1[key], dict2_path, dict2[key]
+                    )
+        # Hack for NetBox v2.6.7 requiring integers for some values
+        elif key in ["status", "type"]:
+            if dict1[key] != dict2[key]["value"]:
+                log.debug(
+                    "Mismatch: %s value is '%s' while %s value is '%s'.",
+                    dict1_path, dict1[key], dict2_path, dict2[key]["value"]
+                    )
+        elif dict1[key] != dict2[key]:
+            log.debug(
+                "Mismatch: %s value is '%s' while %s value is '%s'.",
+                dict1_path, dict1[key], dict2_path, dict2[key]
+                )
+        if not result:
+            log.debug(
+                "%s and %s values do not match.", dict1_path, dict2_path
+                )
+        else:
+            log.debug("%s and %s values match.", dict1_path, dict2_path)
+            result = True
+    return result
 
+def format_slug(text):
+    """
+    Format string to comply to NetBox slug acceptable pattern and max length.
+
+    NetBox slug pattern: ^[-a-zA-Z0-9_]+$
+    NetBox slug max length: 50 characters
+    """
+    allowed_chars = (
+        "abcdefghijklmnopqrstuvxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" # Alphabet
+        "01234567890" # Numbers
+        "_-" # Symbols
+        )
+    # Replace seperators with dash
+    seperators = [" ", ",", "."]
+    for sep in seperators:
+        text = text.replace(sep, "-")
+    # Strip unacceptable characters
+    text = "".join([c for c in text if c in allowed_chars])
+    # Enforce max length
+    return truncate(text, max_len=50).lower()
+
+def format_tag(tag):
+    """
+    Format string to comply to NetBox tag format and max length.
+
+    NetBox tag max length: 100 characters
+    """
+    # If the tag presented is an IP address then no modifications are required
+    try:
+        ip_network(tag)
+    except ValueError:
+        # If an IP was not provided then assume fqdn
+        tag = tag.split(".")[0]
+        tag = truncate(tag, max_len=100)
+    return tag
+
+def truncate(text="", max_len=50):
+    """Ensure a string complies to the maximum length specified."""
+    return text if len(text) < max_len else text[:max_len]
+
+def verify_ip(ip_addr):
+    """
+    Verify input is expected format and checks against allowed networks.
+
+    Allowed networks can be defined in the settings IPV4_ALLOWED and
+    IPV6_ALLOWED variables.
+    """
+    result = False
+    try:
+        log.debug(
+            "Validating IP '%s' is properly formatted and within allowed "
+            "networks.",
+            ip_addr
+            )
+        # Strict is set to false to allow host address checks
+        version = ip_network(ip_addr, strict=False).version
+        global_nets = settings.IPV4_ALLOWED if version == 4 \
+                      else settings.IPV6_ALLOWED
+        # Check whether the network is within the global allowed networks
+        log.debug(
+            "Checking whether IP address '%s' is within %s.", ip_addr,
+            global_nets
+            )
+        net_matches = [
+            ip_network(ip_addr, strict=False).overlaps(ip_network(net))
+            for net in global_nets
+            ]
+        result = any(net_matches)
+    except ValueError as err:
+        log.debug("Validation of %s failed. Received error: %s", ip_addr, err)
+    log.debug("IP '%s' validation returned a %s status.", ip_addr, result)
+    return result
 
 class AzureHandler:
     """Handles Azure session management and object collection."""
@@ -31,8 +148,22 @@ class AzureHandler:
             tenant=settings.AZURE_TENANT_ID,
             )
         # Initialize clients for use across methods
-        self.network_client = None
         self.compute_client = None
+        self.network_client = None
+        self.subscription_client = SubscriptionClient(self.credentials)
+        self.tags = ["Synced", "Azure"]
+
+    def _find_resource_name(self, resource_id, resource_type):
+        """
+        Determine an Azure resource name by parsing its resource ID.
+
+        resource_id = String of URI path for the resource ID
+        resource_type = String of the Azure resource type
+        returns string
+        """
+        resource_id = resource_id.split("/")
+        resource_type_index = resource_id.index(resource_type)
+        return resource_id[resource_type_index+1]
 
     def _get_skus(self):
         """
@@ -44,13 +175,15 @@ class AzureHandler:
         # Unfortunately the resource list is deprecated and this was
         # the documented method for determining memory and vCPU
         # Please feel free to help me find a better way!
-        sub_skus = {}
+        log.debug("Collecting VM SKUs available to the subscription.")
+        sub_vm_skus = {}
         for sku in self.compute_client.resource_skus.list():
             if sku.resource_type == "virtualMachines":
-                sub_skus[sku.name] = {}
+                sub_vm_skus[sku.name] = {}
                 for cap in sku.capabilities:
-                    sub_skus[sku.name][cap.name] = cap.value
-        return sub_skus
+                    sub_vm_skus[sku.name][cap.name] = cap.value
+        log.debug("Collected details of %s available VM SKUs.", len(sub_vm_skus))
+        return sub_vm_skus
 
     def _get_storage(self, vm):
         """
@@ -60,12 +193,13 @@ class AzureHandler:
         returns integer of storage space
         """
         # OS Disk
+        log.debug("Collecting size of VM '%s' OS disk.", vm.name)
         os_disk = vm.storage_profile.os_disk.managed_disk.id
-        os_disk_rg = find_resource_name(
+        os_disk_rg = self._find_resource_name(
             resource_id=os_disk,
             resource_type="resourceGroups"
             )
-        os_disk_id = find_resource_name(
+        os_disk_id = self._find_resource_name(
             resource_id=os_disk,
             resource_type="disks"
             )
@@ -74,6 +208,7 @@ class AzureHandler:
             disk_name=os_disk_id
             ).disk_size_gb
         # Data Disks
+        log.debug("Collecting size of VM '%s' data disk(s).", vm.name)
         for data_disk in vm.storage_profile.data_disks:
             data_disk_size = data_disk.disk_size_gb
             if data_disk_size is not None:
@@ -87,15 +222,15 @@ class AzureHandler:
         vm = Azure virtual machine model
         returns dictionary containing nics and their configuration
         """
-        result = {}
+        results = {"virtual_interfaces": [], "ip_addresses": []}
         vm_nics = vm.network_profile.network_interfaces
         for nic in vm_nics:
             nic_id = nic.id
-            nic_rg = find_resource_name(
+            nic_rg = self._find_resource_name(
                 resource_id=nic_id,
                 resource_type="resourceGroups"
                 )
-            nic_name = find_resource_name(
+            nic_name = self._find_resource_name(
                 resource_id=nic_id,
                 resource_type="networkInterfaces"
                 )
@@ -105,20 +240,29 @@ class AzureHandler:
                 network_interface_name=nic_name
                 )
             nic_mac = nic_conf.mac_address.replace("-", ":")
+            results["virtual_interfaces"].append(
+                {
+                    "virtual_machine": {"name": vm.name},
+                    "name": nic_name,
+                    "type": 0, # 0 = Virtual
+                    "enabled": True,
+                    "mac_address": nic_mac.upper(),
+                    "tags": self.tags
+                })
             # Each NIC may have multiple IP configs
             for ip in nic_conf.ip_configurations:
                 primary_ip = ip.primary
                 priv_ip_addr = ip.private_ip_address
                 subnet = ip.subnet.id
-                subnet_name = find_resource_name(
+                subnet_name = self._find_resource_name(
                     resource_id=subnet,
                     resource_type="subnets"
                     )
-                subnet_rg = find_resource_name(
+                subnet_rg = self._find_resource_name(
                     resource_id=subnet,
                     resource_type="resourceGroups"
                     )
-                subnet_vnet = find_resource_name(
+                subnet_vnet = self._find_resource_name(
                     resource_id=subnet,
                     resource_type="virtualNetworks"
                     )
@@ -134,13 +278,14 @@ class AzureHandler:
                     priv_ip_addr, subnet_cidr
                     )
                 # Collect Public IP config
+                pub_ip_addr = None
                 if hasattr(ip.public_ip_address, "id"):
                     pub_ip_id = ip.public_ip_address.id
-                    pub_ip_rg = find_resource_name(
+                    pub_ip_rg = self._find_resource_name(
                         resource_id=pub_ip_id,
                         resource_type="resourceGroups"
                         )
-                    pub_ip_name = find_resource_name(
+                    pub_ip_name = self._find_resource_name(
                         resource_id=pub_ip_id,
                         resource_type="publicIPAddresses"
                         )
@@ -149,56 +294,144 @@ class AzureHandler:
                         public_ip_address_name=pub_ip_name
                         )
                     pub_ip_addr = pub_ip.ip_address
+                # Create records for all IPs found
+                ips = [
+                    ip for ip in [priv_ip_addr, pub_ip_addr] if ip is not None
+                    ]
+                for ip_addr in ips:
+                    results["ip_addresses"].append(
+                        {
+                            "address": ip_addr,
+                            "vrf": None,
+                            "tenant": None,
+                            "interface": {
+                                "virtual_machine": {
+                                    "name": vm.name
+                                    },
+                                "name": nic_name,
+                                },
+                            "tags": self.tags,
+                        })
+                return results
+
+    def get_subscriptions(self):
+        """
+        Get Azure subscriptions available under the provided tenant ID.
+
+        returns dict of subscription id key and name value pair
+        """
+        log.debug("Collecting subscriptions available to Azure tenant.")
+        subscriptions = {}
+        for sub in self.subscription_client.subscriptions.list():
+            subscriptions[sub.subscription_id] = sub.display_name
+        return subscriptions
+
+    def _get_regions(self, subscription_id):
+        """
+        Get a list of regions available for the provided subscription ID.
+
+        returns dict of regions
+        """
+        log.debug(
+            "Collecting regions available to subscription ID '{}'.".format(
+            subscription_id
+            ))
+        results = {}
+        regions = self.subscription_client.subscriptions.list_locations(
+            subscription_id=subscription_id
+            )
+        for region in regions:
+            results[region.name] = {
+                "description": "Microsoft Azure {}".format(region.display_name),
+                "latitude": region.latitude,
+                "longitude": region.longitude,
+                }
+        return results
 
     def get_vms(self):
         """Get Azure Virtual Machine information."""
-        # Subscriptions
-        subscription_client = SubscriptionClient(self.credentials)
-        for sub in subscription_client.subscriptions.list():
-            sub_id = sub.subscription_id
-            sub_skus = {}
+        # Initialize expected result keys
+        results = {
+            "sites": [],
+            "virtual_machines": [],
+            "virtual_interfaces": [],
+            "ip_addresses": []
+            }
+        used_regions = []
+        subscriptions = self.get_subscriptions()
+        for sub_id in subscriptions:
+            log.info("Accessing Azure Subscription ID '%s'.", sub_id)
+            sub_vm_skus = {} # Store  available subscription VM SKU details
             self.network_client = NetworkManagementClient(
                 self.credentials, sub_id
                 )
             self.compute_client = ComputeManagementClient(
                 self.credentials, sub_id
                 )
-            print("#"*16, "Subscription ID", sub_id, "#"*16)
             # Some subscriptions are not readable so catch and move on
             try:
                 for vm in self.compute_client.virtual_machines.list_all():
                     # We check whether the subscription SKUs have been collected
                     # only if the subscription has VMs. This saves lots of time.
-                    if not sub_skus:
-                        sub_skus = self._get_skus()
+                    if not sub_vm_skus:
+                        sub_vm_skus = self._get_skus()
                     # Virtual Machine info
-                    vm_location = vm.location
-                    vm_name = vm.name
+                    log.info(
+                        "Collecting information for Azure VM '%s'.",
+                        vm.name
+                        )
+                    # Collect all regions used by VMs
+                    if vm.location not in used_regions:
+                        log.debug(
+                            "VM region '%s' added to used regions.", vm.location
+                            )
+                        used_regions.append(vm.location)
                     vm_size = vm.hardware_profile.vm_size
-                    vm_cpus = sub_skus[vm_size]["vCPUs"]
-                    vm_mem = int(float(sub_skus[vm_size]["MemoryGB"]) * 1024.0)
+                    vm_cpus = sub_vm_skus[vm_size]["vCPUs"]
+                    vm_mem = int(
+                        float(sub_vm_skus[vm_size]["MemoryGB"]) * 1024.0
+                        )
                     os_type = vm.storage_profile.os_disk.os_type.value
-                    # Storage
-                    storage_sum = self._get_storage(vm)
-                    # VM Summary
-                    print(
-                        "VM Name: {} | Location: {} | OS Type: {} | "
-                        "Disk Sum: {} GB | vCPUS: {} | RAM: {} MB"
-                        .format(
-                            vm_name, vm_location, os_type, storage_sum,
-                            vm_cpus, vm_mem
-                            ))
-                    # Network
-                    network_conf = self._get_network_config(vm)
-                    print(network_conf)
+                    if os_type is not None:
+                        os_type = {"name": os_type}
+                    storage_size = self._get_storage(vm)
+                    results["virtual_machines"].append(
+                        {
+                            "name": vm.name,
+                            "status": 1,
+                            "cluster": {"name": "Microsoft Azure"},
+                            "site": {"slug": vm.location},
+                            "role": {"name": "Server"},
+                            "platform": os_type,
+                            "vcpus": vm_cpus,
+                            "memory": vm_mem,
+                            "disk": storage_size,
+                            "tags": self.tags,
+                        })
+                    # Network configuration
+                    network_objects = self._get_network_config(vm)
+                    for key in network_objects:
+                        results[key].append(network_objects[key])
             except azure_exceptions.CloudError as err:
-                print(
-                    "Unable to collect data from subscription ID {}. Received "
-                    "error '{}: {}'".format(
-                        sub_id, err.error.error, err.message
-                        ))
-
+                log.warning(
+                    "Unable to collect data from subscription ID '%s'. "
+                    "Received error '%s: %s'", sub_id, err.error.error,
+                    err.message
+                    )
+        # Sites are done after virtual machines to ensure we only build
+        # relevant regions
+        avail_regions = self._get_regions(sub_id)
+        for region in used_regions:
+            results["sites"].append(
+                {
+                    "name": avail_regions[region]["description"],
+                    "slug": format_slug("azure-{}".format(region)),
+                    "latitude": avail_regions[region]["latitude"],
+                    "longitude": avail_regions[region]["longitude"],
+                    "tags": self.tags,
+                })
+        return results
 
 if __name__ == "__main__":
     azure = AzureHandler()
-    azure.get_vms()
+    log.debug(azure.get_vms())
