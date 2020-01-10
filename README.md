@@ -14,6 +14,7 @@ The following objects are tracked and synced between Azure and NetBox. Object ty
 
 | Azure            | NetBox                                     | Supports Tags |
 |------------------|--------------------------------------------|---------------|
+| Regions          | Sites                                      | Yes           |
 | Subnets          | Prefixes                                   | Yes           |
 | Virtual Machines | Interfaces, IP Addresses, Virtual Machines | Yes           |
 | Virtual Networks | Prefixes                                   | Yes           |
