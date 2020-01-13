@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Collects Azure resources and syncs them to Netbox via Python3"""
 
+from ipaddress import ip_network
 from azure.common.credentials import ServicePrincipalCredentials
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.resource import SubscriptionClient
@@ -8,6 +9,15 @@ from azure.mgmt.compute import ComputeManagementClient
 from msrestazure import azure_exceptions
 import settings
 from logger import log
+
+
+def az_slug(text):
+    """
+    Prefix string with 'azure-' and then format for NetBox.
+
+    returns string
+    """
+    return format_slug("azure-{}".format(text))
 
 
 def compare_dicts(dict1, dict2, dict1_name="d1", dict2_name="d2", path=""):
@@ -65,6 +75,18 @@ def compare_dicts(dict1, dict2, dict1_name="d1", dict2_name="d2", path=""):
             log.debug("%s and %s values match.", dict1_path, dict2_path)
             result = True
     return result
+
+def find_resource_name(resource_id, resource_type):
+    """
+    Determine an Azure resource name by parsing its resource ID.
+
+    resource_id = String of URI path for the resource ID
+    resource_type = String of the Azure resource type
+    returns string
+    """
+    resource_id = resource_id.split("/")
+    resource_type_index = resource_id.index(resource_type)
+    return resource_id[resource_type_index+1]
 
 def format_slug(text):
     """
@@ -153,18 +175,6 @@ class AzureHandler:
         self.subscription_client = SubscriptionClient(self.credentials)
         self.tags = ["Synced", "Azure"]
 
-    def _find_resource_name(self, resource_id, resource_type):
-        """
-        Determine an Azure resource name by parsing its resource ID.
-
-        resource_id = String of URI path for the resource ID
-        resource_type = String of the Azure resource type
-        returns string
-        """
-        resource_id = resource_id.split("/")
-        resource_type_index = resource_id.index(resource_type)
-        return resource_id[resource_type_index+1]
-
     def _get_skus(self):
         """
         Provide Virtual Machine SKUs available for the provided subscription.
@@ -195,11 +205,11 @@ class AzureHandler:
         # OS Disk
         log.debug("Collecting size of VM '%s' OS disk.", vm.name)
         os_disk = vm.storage_profile.os_disk.managed_disk.id
-        os_disk_rg = self._find_resource_name(
+        os_disk_rg = find_resource_name(
             resource_id=os_disk,
             resource_type="resourceGroups"
             )
-        os_disk_id = self._find_resource_name(
+        os_disk_id = find_resource_name(
             resource_id=os_disk,
             resource_type="disks"
             )
@@ -226,11 +236,11 @@ class AzureHandler:
         vm_nics = vm.network_profile.network_interfaces
         for nic in vm_nics:
             nic_id = nic.id
-            nic_rg = self._find_resource_name(
+            nic_rg = find_resource_name(
                 resource_id=nic_id,
                 resource_type="resourceGroups"
                 )
-            nic_name = self._find_resource_name(
+            nic_name = find_resource_name(
                 resource_id=nic_id,
                 resource_type="networkInterfaces"
                 )
@@ -251,18 +261,17 @@ class AzureHandler:
                 })
             # Each NIC may have multiple IP configs
             for ip in nic_conf.ip_configurations:
-                primary_ip = ip.primary
                 priv_ip_addr = ip.private_ip_address
                 subnet = ip.subnet.id
-                subnet_name = self._find_resource_name(
+                subnet_name = find_resource_name(
                     resource_id=subnet,
                     resource_type="subnets"
                     )
-                subnet_rg = self._find_resource_name(
+                subnet_rg = find_resource_name(
                     resource_id=subnet,
                     resource_type="resourceGroups"
                     )
-                subnet_vnet = self._find_resource_name(
+                subnet_vnet = find_resource_name(
                     resource_id=subnet,
                     resource_type="virtualNetworks"
                     )
@@ -281,11 +290,11 @@ class AzureHandler:
                 pub_ip_addr = None
                 if hasattr(ip.public_ip_address, "id"):
                     pub_ip_id = ip.public_ip_address.id
-                    pub_ip_rg = self._find_resource_name(
+                    pub_ip_rg = find_resource_name(
                         resource_id=pub_ip_id,
                         resource_type="resourceGroups"
                         )
-                    pub_ip_name = self._find_resource_name(
+                    pub_ip_name = find_resource_name(
                         resource_id=pub_ip_id,
                         resource_type="publicIPAddresses"
                         )
@@ -333,9 +342,9 @@ class AzureHandler:
         returns dict of regions
         """
         log.debug(
-            "Collecting regions available to subscription ID '{}'.".format(
+            "Collecting regions available to subscription ID '%s'.",
             subscription_id
-            ))
+            )
         results = {}
         regions = self.subscription_client.subscriptions.list_locations(
             subscription_id=subscription_id
@@ -346,6 +355,51 @@ class AzureHandler:
                 "latitude": region.latitude,
                 "longitude": region.longitude,
                 }
+        return results
+
+    def get_vnets(self):
+        """Get Azure virtual networks for the provided subscription."""
+        results = {"prefixes": []}
+        subscriptions = self.get_subscriptions()
+        for sub_id in subscriptions:
+            log.info("Accessing Azure Subscription ID '%s'.", sub_id)
+            self.network_client = NetworkManagementClient(
+                self.credentials, sub_id
+                )
+            log.info("Collecting VNETs for Azure Subscription ID '%s'.", sub_id)
+            try:
+                for vnet in self.network_client.virtual_networks.list_all():
+                    prefix_template = {
+                        "prefix": "",
+                        "site": {"slug": vnet.location},
+                        "description": "",
+                        # VRF and tenant are initialized and will be updated later
+                        "vrf": None,
+                        "tenant": None,
+                        "status": 1,
+                        "tags": self.tags,
+                        }
+                    log.debug("Collecting VNET '%s' address spaces.", vnet.name)
+                    for prefix in vnet.address_space.address_prefixes:
+                        prefix_template["prefix"] = prefix
+                        prefix_template["description"] = vnet.name
+                        results["prefixes"].append(prefix_template)
+                    for subnet in vnet.subnets:
+                        if subnet.address_prefixes is not None:
+                            for prefix in subnet.address_prefixes:
+                                prefix_template["prefix"] = \
+                                    prefix.address_prefix
+                                results["prefixes"].append(prefix_template)
+                        else:
+                            prefix_template["prefix"] = subnet.address_prefix
+                            prefix_template["description"] = subnet.name
+                            results["prefixes"].append(prefix_template)
+            except azure_exceptions.CloudError as err:
+                log.warning(
+                    "Unable to collect data from subscription ID '%s'. "
+                    "Received error '%s: %s'", sub_id, err.error.error,
+                    err.message
+                    )
         return results
 
     def get_vms(self):
@@ -400,7 +454,7 @@ class AzureHandler:
                             "name": vm.name,
                             "status": 1,
                             "cluster": {"name": "Microsoft Azure"},
-                            "site": {"slug": vm.location},
+                            "site": {"slug": az_slug(vm.location)},
                             "role": {"name": "Server"},
                             "platform": os_type,
                             "vcpus": vm_cpus,
@@ -418,20 +472,21 @@ class AzureHandler:
                     "Received error '%s: %s'", sub_id, err.error.error,
                     err.message
                     )
-        # Sites are done after virtual machines to ensure we only build
-        # relevant regions
-        avail_regions = self._get_regions(sub_id)
-        for region in used_regions:
-            results["sites"].append(
-                {
-                    "name": avail_regions[region]["description"],
-                    "slug": format_slug("azure-{}".format(region)),
-                    "latitude": avail_regions[region]["latitude"],
-                    "longitude": avail_regions[region]["longitude"],
-                    "tags": self.tags,
-                })
+            # Sites are done after virtual machines to ensure we only build
+            # relevant regions
+            avail_regions = self._get_regions(sub_id)
+            for region in used_regions:
+                results["sites"].append(
+                    {
+                        "name": avail_regions[region]["description"],
+                        "slug": az_slug(region),
+                        "latitude": avail_regions[region]["latitude"],
+                        "longitude": avail_regions[region]["longitude"],
+                        "tags": self.tags,
+                    })
         return results
 
 if __name__ == "__main__":
     azure = AzureHandler()
+    log.debug(azure.get_vnets())
     log.debug(azure.get_vms())
