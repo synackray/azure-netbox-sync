@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Collects Azure resources and syncs them to Netbox via Python3"""
 
+from datetime import date, datetime
 from ipaddress import ip_network
+import argparse
+import requests
 from azure.common.credentials import ServicePrincipalCredentials
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.resource import SubscriptionClient
@@ -10,6 +13,42 @@ from msrestazure import azure_exceptions
 import settings
 from logger import log
 
+
+def main():
+    """Main function to run if script is called directly"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-c", "--cleanup", action="store_true",
+        help="Remove all Azure synced objects which support tagging. This is "
+             "helpful if you want to start fresh or stop using this script."
+        )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable verbose output. This overrides the log level in the "
+             "settings file. Intended for debugging purposes only."
+        )
+    args = parser.parse_args()
+    if args.verbose:
+        log.setLevel("DEBUG")
+        log.debug("Log level has been overriden by the --verbose argument.")
+        start_time = datetime.now()
+        if args.cleanup:
+            log.info(
+                "Completed removal of Azure tenant ID '%s' objects. Total "
+                "execution time %s.",
+                settings.AZURE_TENANT_ID, (datetime.now() - start_time)
+                )
+        else:
+            azure = AzureHandler()
+            log.debug(azure.get_vnets())
+            log.debug(azure.get_vms())
+            # nb.verify_dependencies()
+            # nb.sync_objects(vc_obj_type="virtual_machines")
+            log.info(
+                "Completed sync with Azure tenant ID '%s'! Total "
+                "execution time %s.", settings.AZURE_TENANT_ID,
+                (datetime.now() - start_time)
+                )
 
 def az_slug(text):
     """
@@ -235,13 +274,12 @@ class AzureHandler:
         results = {"virtual_interfaces": [], "ip_addresses": []}
         vm_nics = vm.network_profile.network_interfaces
         for nic in vm_nics:
-            nic_id = nic.id
             nic_rg = find_resource_name(
-                resource_id=nic_id,
+                resource_id=nic.id,
                 resource_type="resourceGroups"
                 )
             nic_name = find_resource_name(
-                resource_id=nic_id,
+                resource_id=nic.id,
                 resource_type="networkInterfaces"
                 )
             # Collect IP information for NIC
@@ -486,7 +524,6 @@ class AzureHandler:
                     })
         return results
 
+
 if __name__ == "__main__":
-    azure = AzureHandler()
-    log.debug(azure.get_vnets())
-    log.debug(azure.get_vms())
+    main()
