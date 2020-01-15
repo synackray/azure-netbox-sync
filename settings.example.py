@@ -20,3 +20,4 @@ NB_INSECURE_TLS = False # Leverage SSL/TLS but ignore certificate errors (ex. ex
 NB_PORT = 443 # [optional] NetBox port to connect to if changed from the default
 NB_PRUNE_ENABLED = True # Automatically orphan and delete objects if they are no longer in their source system
 NB_PRUNE_DELAY_DAYS = 0 # How many days should we wait before pruning an orphaned object
+NB_OVERWRITE_PREFIXES = False # If Azure discovered prefixes already exist in NetBox should they be overridden?

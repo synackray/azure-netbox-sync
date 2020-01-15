@@ -43,7 +43,7 @@ def main():
             log.debug(azure.get_vnets())
             log.debug(azure.get_vms())
             # nb.verify_dependencies()
-            # nb.sync_objects(vc_obj_type="virtual_machines")
+            # nb.sync_objects(az_obj_type="virtual_machines")
             log.info(
                 "Completed sync with Azure tenant ID '%s'! Total "
                 "execution time %s.", settings.AZURE_TENANT_ID,
@@ -523,6 +523,628 @@ class AzureHandler:
                         "tags": self.tags,
                     })
         return results
+
+class NetBoxHandler:
+    """Handles NetBox connection state and interaction with the API"""
+    def __init__(self):
+        self.header = {"Authorization": "Token {}".format(settings.NB_API_KEY)}
+        self.nb_api_url = "http{}://{}{}/api/".format(
+            ("s" if not settings.NB_DISABLE_TLS else ""), settings.NB_FQDN,
+            (":{}".format(settings.NB_PORT) if settings.NB_PORT != 443 else "")
+            )
+        self.nb_session = None
+        # NetBox object type relationships when working in the API
+        self.obj_map = {
+            "cluster_groups": {
+                "api_app": "virtualization",
+                "api_model": "cluster-groups",
+                "key": "name",
+                "prune": False,
+                },
+            "cluster_types": {
+                "api_app": "virtualization",
+                "api_model": "cluster-types",
+                "key": "name",
+                "prune": False,
+                },
+            "clusters": {
+                "api_app": "virtualization",
+                "api_model": "clusters",
+                "key": "name",
+                "prune": True,
+                "prune_pref": 2
+                },
+            "device_roles": {
+                "api_app": "dcim",
+                "api_model": "device-roles",
+                "key": "name",
+                "prune": False,
+                },
+            "device_types": {
+                "api_app": "dcim",
+                "api_model": "device-types",
+                "key": "model",
+                "prune": True,
+                "prune_pref": 3
+                },
+            "devices": {
+                "api_app": "dcim",
+                "api_model": "devices",
+                "key": "name",
+                "prune": True,
+                "prune_pref": 4
+                },
+            "interfaces": {
+                "api_app": "dcim",
+                "api_model": "interfaces",
+                "key": "name",
+                "prune": True,
+                "prune_pref": 5
+                },
+            "ip_addresses": {
+                "api_app": "ipam",
+                "api_model": "ip-addresses",
+                "key": "address",
+                "prune": True,
+                "prune_pref": 9
+                },
+            "manufacturers": {
+                "api_app": "dcim",
+                "api_model": "manufacturers",
+                "key": "name",
+                "prune": False,
+                },
+            "platforms": {
+                "api_app": "dcim",
+                "api_model": "platforms",
+                "key": "name",
+                "prune": False,
+                },
+            "prefixes": {
+                "api_app": "ipam",
+                "api_model": "prefixes",
+                "key": "prefix",
+                "prune": True,
+                "prune_pref": 8
+                },
+            "sites": {
+                "api_app": "dcim",
+                "api_model": "sites",
+                "key": "name",
+                "prune": True,
+                "prune_pref": 1
+                },
+            "tags": {
+                "api_app": "extras",
+                "api_model": "tags",
+                "key": "name",
+                "prune": False,
+                },
+            "virtual_machines": {
+                "api_app": "virtualization",
+                "api_model": "virtual-machines",
+                "key": "name",
+                "prune": True,
+                "prune_pref": 6
+                },
+            "virtual_interfaces": {
+                "api_app": "virtualization",
+                "api_model": "interfaces",
+                "key": "name",
+                "prune": True,
+                "prune_pref": 7
+                },
+            }
+
+    def request(self, req_type, nb_obj_type, data=None, query=None, nb_id=None):
+        """
+        HTTP requests and exception handler for NetBox
+
+        req_type: HTTP Method
+        nb_obj_type: NetBox object type, must match keys in self.obj_map
+        data: Dictionary to be passed as request body.
+        query: String used to filter results when using GET method
+        nb_id: Integer used when working with a single NetBox object
+        """
+        # If an existing session is not already found then create it
+        # The goal here is session re-use without TCP handshake on every request
+        if not self.nb_session:
+            self.nb_session = requests.Session()
+            self.nb_session.headers.update(self.header)
+        result = None
+        # Generate URL
+        url = "{}{}/{}/{}{}".format(
+            self.nb_api_url,
+            self.obj_map[nb_obj_type]["api_app"], # App that model falls under
+            self.obj_map[nb_obj_type]["api_model"], # Data model
+            query if query else "",
+            "{}/".format(nb_id) if nb_id else ""
+            )
+        log.debug("Sending %s to '%s'", req_type.upper(), url)
+        req = getattr(self.nb_session, req_type)(
+            url, json=data, timeout=10, verify=(not settings.NB_INSECURE_TLS)
+            )
+        # Parse status
+        if req.status_code == 200:
+            log.debug(
+                "NetBox %s request OK; returned %s status.", req_type.upper(),
+                req.status_code
+                )
+            result = req.json()
+            if req_type == "get":
+                # NetBox returns 50 results by default, this ensures all results
+                # are bundled together
+                while req.json()["next"] is not None:
+                    url = req.json()["next"]
+                    log.debug(
+                        "NetBox returned more than 50 objects. Sending %s to "
+                        "%s for additional objects.", req_type.upper(), url
+                        )
+                    req = getattr(self.nb_session, req_type)(url, timeout=10)
+                    result["results"] += req.json()["results"]
+        elif req.status_code in [201, 204]:
+            log.info(
+                "NetBox successfully %s %s object.",
+                "created" if req.status_code == 201 else "deleted",
+                nb_obj_type,
+                )
+        elif req.status_code == 400:
+            if req_type == "post":
+                log.warning(
+                    "NetBox failed to create %s object. A duplicate record may "
+                    "exist or the data sent is not acceptable.", nb_obj_type
+                    )
+                log.debug(
+                    "NetBox %s status reason: %s", req.status_code, req.json()
+                    )
+            elif req_type == "put":
+                log.warning(
+                    "NetBox failed to modify %s object with status %s. The "
+                    "data sent may not be acceptable.", nb_obj_type,
+                    req.status_code
+                    )
+                log.debug(
+                    "NetBox %s status reason: %s", req.status_code, req.json()
+                    )
+            else:
+                raise SystemExit(
+                    log.critical(
+                        "Well this in unexpected. Please report this. "
+                        "%s request received %s status with body '%s' and "
+                        "response '%s'.",
+                        req_type.upper(), req.status_code, data, req.json()
+                        )
+                    )
+            log.debug("Unaccepted request data: %s", data)
+        elif req.status_code == 409 and req_type == "delete":
+            log.warning(
+                "Received %s status when attemping to delete NetBox object "
+                "(ID: %s). Please check the object dependencies.",
+                req.status_code, nb_id
+                )
+            log.debug("NetBox %s status body: %s", req.status_code, req.json())
+        else:
+            raise SystemExit(
+                log.critical(
+                    "Well this in unexpected. Please report this. "
+                    "%s request received %s status with body '%s' and response "
+                    "'%s'.",
+                    req_type.upper(), req.status_code, data, req.json()
+                    )
+                )
+        return result
+
+    def obj_exists(self, nb_obj_type, az_data):
+        """
+        Checks whether a NetBox object exists and matches the Azure object.
+
+        If object does not exist or does not match the Azure object it will
+        be created or updated.
+
+        nb_obj_type: String NetBox object type to query for and compare against
+        az_data: Dictionary of Azure object key value pairs pre-formatted for
+        NetBox
+        """
+        # NetBox object types do not have a standard key to search and filter
+        # them by therefore we look up the appropriate key
+        query_key = self.obj_map[nb_obj_type]["key"]
+        # Create a query specific to the device parent/child relationship when
+        # working with interfaces
+        if nb_obj_type == "interfaces":
+            query = "?device={}&{}={}".format(
+                az_data["device"]["name"], query_key, az_data[query_key]
+                )
+        elif nb_obj_type == "virtual_interfaces":
+            query = "?virtual_machine={}&{}={}".format(
+                az_data["virtual_machine"]["name"], query_key,
+                az_data[query_key]
+                )
+        else:
+            query = "?{}={}".format(query_key, az_data[query_key])
+        req = self.request(
+            req_type="get", nb_obj_type=nb_obj_type,
+            query=query
+            )
+        # A single matching object is found so we compare its values to the new
+        # object
+        if req["count"] == 1:
+            log.debug(
+                "NetBox %s object '%s' already exists. Comparing values.",
+                nb_obj_type, az_data[query_key]
+                )
+            nb_data = req["results"][0]
+            # Objects that have been previously tagged as orphaned but then
+            # reappear in Azure need to be stripped of their orphaned status
+            if "tags" in az_data and "Orphaned" in nb_data["tags"]:
+                log.info(
+                    "NetBox %s object '%s' is currently marked as orphaned "
+                    "but has reappeared in Azure. Updating NetBox.",
+                    nb_obj_type, az_data[query_key]
+                    )
+                self.request(
+                    req_type="put", nb_obj_type=nb_obj_type, data=az_data,
+                    nb_id=nb_data["id"]
+                    )
+            elif compare_dicts(
+                    az_data, nb_data, dict1_name="az_data",
+                    dict2_name="nb_data"):
+                log.info(
+                    "NetBox %s object '%s' match current values. Moving on.",
+                    nb_obj_type, az_data[query_key]
+                    )
+            else:
+                log.info(
+                    "NetBox %s object '%s' do not match current values.",
+                    nb_obj_type, az_data[query_key]
+                    )
+                if "tags" in az_data:
+                    log.debug("Merging tags between Azure and NetBox object.")
+                    az_data["tags"] = list(
+                        set(az_data["tags"] + nb_data["tags"])
+                        )
+                self.request(
+                    req_type="put", nb_obj_type=nb_obj_type, data=az_data,
+                    nb_id=nb_data["id"]
+                    )
+        elif req["count"] > 1:
+            log.warning(
+                "Search for NetBox %s object '%s' returned %s results but "
+                "should have only returned 1. Please manually review and "
+                "report this if the data is accurate. Skipping for safety.",
+                nb_obj_type, az_data[query_key], req["count"]
+                )
+        else:
+            log.info(
+                "Netbox %s '%s' object not found. Requesting creation.",
+                nb_obj_type,
+                az_data[query_key],
+                )
+            self.request(
+                req_type="post", nb_obj_type=nb_obj_type, data=az_data
+                )
+
+    def sync_objects(self, az_obj_type):
+        """
+        Collect resources of type from Azure and syncs them to NetBox.
+
+        Some NB object types do not support tags so they will be a one-way sync
+        meaning orphaned objects will not be removed from NetBox.
+        """
+        # Collect data from Azure
+        log.info(
+            "Initiated sync of Azure %s objects to NetBox.",
+            az_obj_type[:-1]
+            )
+        # Dynamically accept any of the AzureHandler class get_ functions
+        az_objects = getattr(AzureHandler(), "get_{}".format(az_obj_type))()
+        nb_obj_types = list(az_objects.keys())
+        for nb_obj_type in nb_obj_types:
+            log.info(
+                "Starting sync of %s Azure %s object%s to NetBox %s "
+                "object%s.",
+                len(az_objects[nb_obj_type]),
+                az_obj_type,
+                "s" if len(az_objects[nb_obj_type]) != 1 else "",
+                nb_obj_type,
+                "s" if len(az_objects[nb_obj_type]) != 1 else "",
+                )
+            for obj in az_objects[nb_obj_type]:
+                # Check to ensure IP addresses pass all checks before syncing
+                # to NetBox
+                if nb_obj_type == "ip_addresses":
+                    ip_addr = obj["address"]
+                    if verify_ip(ip_addr):
+                        log.debug(
+                            "IP %s has passed necessary pre-checks.",
+                            ip_addr
+                            )
+                        # Update IP address to CIDR notation for comparsion
+                        # with existing NetBox objects
+                        obj["address"] = format_ip(ip_addr)
+                        # Search for parent prefix to assign VRF and tenancy
+                        prefix = self.search_prefix(obj["address"])
+                        # Update placeholder values with matched values
+                        obj["vrf"] = prefix["vrf"]
+                        obj["tenant"] = prefix["tenant"]
+                    else:
+                        log.debug(
+                            "IP %s has failed necessary pre-checks. Skipping "
+                            "sync to NetBox.", ip_addr,
+                            )
+                        continue
+                self.obj_exists(nb_obj_type=nb_obj_type, az_data=obj)
+            log.info(
+                "Finished sync of %s Azure %s object%s to NetBox %s "
+                "object%s.",
+                len(az_objects[nb_obj_type]),
+                az_obj_type,
+                "s" if len(az_objects[nb_obj_type]) != 1 else "",
+                nb_obj_type,
+                "s" if len(az_objects[nb_obj_type]) != 1 else "",
+                )
+        # Send Azure objects to the pruner
+        if settings.NB_PRUNE_ENABLED:
+            self.prune_objects(az_objects, az_obj_type)
+
+    def prune_objects(self, az_objects, az_obj_type):
+        """
+        Collects NetBox objects and checks if they still exist in Azure.
+
+        If NetBox objects are not found in the supplied az_objects data then
+        they will go through a pruning process.
+
+        az_objects: Dictionary of Azure object types and list of their objects
+        az_obj_type: The parent object type called during the sync. This is
+        used to determine whether special filtering needs to be applied.
+        """
+        # Determine which of our NetBox objects types support pruning
+        nb_obj_types = [t for t in az_objects if self.obj_map[t]["prune"]]
+        # Sort NetBox object types by pruning priority. This ensures
+        # we do not have issues with deleting objects with dependencies.
+        nb_obj_types = sorted(
+            nb_obj_types, key=lambda t: self.obj_map[t]["prune_pref"],
+            reverse=True
+            )
+        for nb_obj_type in nb_obj_types:
+            log.info(
+                "Comparing existing NetBox %s objects to current Azure "
+                "objects for pruning eligibility.", nb_obj_type
+                )
+            nb_objects = self.request(
+                req_type="get", nb_obj_type=nb_obj_type,
+                # Tags need to always be searched by slug
+                query="?tag={}".format(format_slug("Azure"))
+                )["results"]
+            # Issue 33: As of NetBox v2.6.11 it is not possible to filter
+            # virtual interfaces by tag. Therefore we filter post collection.
+            if az_obj_type == "virtual_machines" and \
+                    nb_obj_type == "virtual_interfaces":
+                nb_objects = [
+                    obj for obj in nb_objects
+                    if "Azure" in obj["tags"]
+                    ]
+                log.debug(
+                    "Found %s virtual interfaces with tag 'Azure'.",
+                    len(nb_objects)
+                    )
+            elif az_obj_type == "virtual_machines" and \
+                    nb_obj_type == "ip_addresses":
+                nb_objects = [
+                    obj for obj in nb_objects
+                    if obj["interface"]["virtual_machine"] is not None
+                    ]
+            # NetBox object types do not have a standard key to search and
+            # filter them by therefore we look up the appropriate key
+            query_key = self.obj_map[nb_obj_type]["key"]
+            vc_obj_values = [obj[query_key] for obj in az_objects[nb_obj_type]]
+            orphans = [
+                obj for obj in nb_objects if obj[query_key] not in vc_obj_values
+                ]
+            log.info(
+                "Comparison completed. %s %s orphaned NetBox object%s did not "
+                "match.",
+                len(orphans), nb_obj_type, "s" if len(orphans) != 1 else ""
+                )
+            log.debug("The following objects did not match: %s", orphans)
+            # Pruned items are checked against the prune timer
+            # All pruned items are first tagged so it is clear why they were
+            # deleted, and then those items which are greater than the max age
+            # will be deleted permanently
+            for orphan in orphans:
+                log.info(
+                    "Processing orphaned NetBox %s '%s' object.",
+                    nb_obj_type, orphan[query_key]
+                    )
+                if "Orphaned" not in orphan["tags"]:
+                    log.info(
+                        "No tag found. Adding 'Orphaned' tag to %s '%s' "
+                        "object.",
+                        nb_obj_type, orphan[query_key]
+                        )
+                    tags = {
+                        "tags": ["Synced", "Azure", "Orphaned"]
+                        }
+                    self.request(
+                        req_type="patch", nb_obj_type=nb_obj_type,
+                        nb_id=orphan["id"],
+                        data=tags
+                        )
+                # Check if the orphan has gone past the max prune timer and
+                # needs to be deleted
+                # Dates are in YY, MM, DD format
+                current_date = date.today()
+                # Some objects do not have a last_updated field so we must
+                # handle that gracefully and send for deletion
+                del_obj = False
+                try:
+                    modified_date = date(
+                        int(orphan["last_updated"][:4]), # Year
+                        int(orphan["last_updated"][5:7]), # Month
+                        int(orphan["last_updated"][8:10]) # Day
+                        )
+                    # Calculated timedelta then converts it to the days integer
+                    days_orphaned = (current_date - modified_date).days
+                    if days_orphaned >= settings.NB_PRUNE_DELAY_DAYS:
+                        log.info(
+                            "The %s '%s' object has exceeded the %s day max "
+                            "for orphaned objects. Sending it for deletion.",
+                            nb_obj_type, orphan[query_key],
+                            settings.NB_PRUNE_DELAY_DAYS
+                            )
+                        del_obj = True
+                    else:
+                        log.info(
+                            "The %s '%s' object has been orphaned for %s of %s "
+                            "max days. Proceeding to next object.",
+                            nb_obj_type, orphan[query_key], days_orphaned,
+                            settings.NB_PRUNE_DELAY_DAYS
+                            )
+                except KeyError as err:
+                    log.debug(
+                        "The %s '%s' object does not have a %s "
+                        "field. Sending it for deletion.",
+                        nb_obj_type, orphan[query_key], err
+                        )
+                    del_obj = True
+                if del_obj:
+                    self.request(
+                        req_type="delete", nb_obj_type=nb_obj_type,
+                        nb_id=orphan["id"],
+                        )
+
+    def search_prefix(self, ip_addr):
+        """
+        Queries Netbox for the parent prefix of any supplied IP address.
+
+        Returns dictionary of VRF and tenant values.
+        """
+        result = {"tenant": None, "vrf": None}
+        query = "?contains={}".format(ip_addr)
+        try:
+            prefix_obj = self.request(
+                req_type="get", nb_obj_type="prefixes", query=query
+                )["results"][-1] # -1 used to choose the most specific result
+            prefix = prefix_obj["prefix"]
+            for key in result:
+                # Ensure the data returned was not null.
+                try:
+                    result[key] = {"name": prefix_obj[key]["name"]}
+                except TypeError:
+                    log.debug(
+                        "No %s key was found in the parent prefix. Nulling.",
+                        key
+                        )
+                    result[key] = None
+            log.debug(
+                "IP address %s is a child of prefix %s with the following "
+                "attributes: %s", ip_addr, prefix, result
+                )
+        except IndexError:
+            log.debug("No parent prefix was found for IP %s.", ip_addr)
+        return result
+
+    def verify_dependencies(self):
+        """
+        Validates that all prerequisite NetBox objects exist and creates them.
+        """
+        dependencies = {
+            "platforms": [
+                {"name": "Windows", "slug": "windows"},
+                {"name": "Linux", "slug": "linux"},
+                ],
+            "cluster_types": [
+                {"name": "VMware ESXi", "slug": "vmware-esxi"}
+                ],
+            "device_roles": [
+                {
+                    "name": "Server",
+                    "slug": "server",
+                    "color": "9e9e9e",
+                    "vm_role": True
+                }],
+            "tags": [
+                {
+                    "name": "Orphaned",
+                    "slug": "orphaned",
+                    "color": "607d8b",
+                    "comments": "This applies to objects that have become "
+                                "orphaned. The source system which has "
+                                "previously provided the object no longer "
+                                "states it exists.{}".format(
+                                    " An object with the 'Orphaned' tag will "
+                                    "remain in this state until it ages out "
+                                    "and is automatically removed."
+                                    ) if settings.NB_PRUNE_ENABLED else ""
+                },
+                {
+                    "name": "Azure",
+                    "slug": "azure",
+                    "comments": "Objects synced from Azure. Be careful not to "
+                                "modify the name or slug."
+                }]
+            }
+        # For each dependency of each type verify object exists
+        log.info("Verifying all prerequisite objects exist in NetBox.")
+        for dep_type in dependencies:
+            log.debug(
+                "Checking NetBox has necessary %s objects.", dep_type[:-1]
+                )
+            for dep in dependencies[dep_type]:
+                self.obj_exists(nb_obj_type=dep_type, az_data=dep)
+        log.info("Finished verifying prerequisites.")
+
+    def remove_all(self):
+        """
+        Searches NetBox for all Azure synced objects and then removes them.
+
+        This is intended to be used in the case you wish to start fresh or stop
+        using the script.
+        """
+        log.info(
+            "Preparing for the removal of all Azure objects synced to NetBox."
+            )
+        nb_obj_types = [
+            t for t in self.obj_map if self.obj_map[t]["prune"]
+            ]
+        # Honor pruning preference, highest to lowest
+        nb_obj_types = sorted(
+            nb_obj_types, key=lambda t: self.obj_map[t]["prune_pref"],
+            reverse=True
+            )
+        for nb_obj_type in nb_obj_types:
+            log.info(
+                "Collecting all current NetBox %s objects to prepare for "
+                "deletion.", nb_obj_type
+                )
+            nb_objects = self.request(
+                req_type="get", nb_obj_type=nb_obj_type,
+                query="?tag=azure"
+                )["results"]
+            # NetBox virtual interfaces do not currently support filtering
+            # by tags. Therefore we collect all virtual interfaces and
+            # filter them post collection.
+            if nb_obj_type == "virtual_interfaces":
+                log.debug("Collected %s virtual interfaces pre-filtering.")
+                nb_objects = [
+                    obj for obj in nb_objects if "Azure" in obj["tags"]
+                    ]
+                log.debug(
+                    "Filtered to %s virtual interfaces with 'Azure' tag.",
+                    len(nb_objects)
+                    )
+            query_key = self.obj_map[nb_obj_type]["key"]
+            log.info(
+                "Deleting %s NetBox %s objects.", len(nb_objects), nb_obj_type
+                )
+            for obj in nb_objects:
+                log.info(
+                    "Deleting NetBox %s '%s' object.", nb_obj_type,
+                    obj[query_key]
+                    )
+                self.request(
+                    req_type="delete", nb_obj_type=nb_obj_type,
+                    nb_id=obj["id"],
+                    )
 
 
 if __name__ == "__main__":
