@@ -39,11 +39,10 @@ def main():
                 settings.AZURE_TENANT_ID, (datetime.now() - start_time)
                 )
         else:
-            azure = AzureHandler()
-            log.debug(azure.get_vnets())
-            log.debug(azure.get_vms())
-            # nb.verify_dependencies()
-            # nb.sync_objects(az_obj_type="virtual_machines")
+            nb = NetBoxHandler()
+            nb.verify_dependencies()
+            nb.sync_objects(az_obj_type="vms")
+            nb.sync_objects(az_obj_type="vnets")
             log.info(
                 "Completed sync with Azure tenant ID '%s'! Total "
                 "execution time %s.", settings.AZURE_TENANT_ID,
@@ -69,12 +68,13 @@ def compare_dicts(dict1, dict2, dict1_name="d1", dict2_name="d2", path=""):
     """
     # Setup paths to track key exploration. The path parameter is used to allow
     # recursive comparisions and track what's being compared.
-    result = False
+    result = True
     for key in dict1.keys():
         dict1_path = "{}{}[{}]".format(dict1_name, path, key)
         dict2_path = "{}{}[{}]".format(dict2_name, path, key)
         if key not in dict2.keys():
             log.debug("%s not a valid key in %s.", dict1_path, dict2_path)
+            result = False
         elif isinstance(dict1[key], dict) and isinstance(dict2[key], dict):
             log.debug(
                 "%s and %s contain dictionary. Evaluating.", dict1_path,
@@ -94,6 +94,7 @@ def compare_dicts(dict1, dict2, dict1_name="d1", dict2_name="d2", path=""):
                     "Mismatch: %s value is '%s' while %s value is '%s'.",
                     dict1_path, dict1[key], dict2_path, dict2[key]
                     )
+                result = False
         # Hack for NetBox v2.6.7 requiring integers for some values
         elif key in ["status", "type"]:
             if dict1[key] != dict2[key]["value"]:
@@ -101,18 +102,19 @@ def compare_dicts(dict1, dict2, dict1_name="d1", dict2_name="d2", path=""):
                     "Mismatch: %s value is '%s' while %s value is '%s'.",
                     dict1_path, dict1[key], dict2_path, dict2[key]["value"]
                     )
+                result = False
         elif dict1[key] != dict2[key]:
             log.debug(
                 "Mismatch: %s value is '%s' while %s value is '%s'.",
                 dict1_path, dict1[key], dict2_path, dict2[key]
                 )
+            result = False
         if not result:
             log.debug(
                 "%s and %s values do not match.", dict1_path, dict2_path
                 )
         else:
             log.debug("%s and %s values match.", dict1_path, dict2_path)
-            result = True
     return result
 
 def find_resource_name(resource_id, resource_type):
@@ -257,7 +259,7 @@ class AzureHandler:
             disk_name=os_disk_id
             ).disk_size_gb
         # Data Disks
-        log.debug("Collecting size of VM '%s' data disk(s).", vm.name)
+        log.debug("Collecting size of VM '%s' data disks.", vm.name)
         for data_disk in vm.storage_profile.data_disks:
             data_disk_size = data_disk.disk_size_gb
             if data_disk_size is not None:
@@ -390,8 +392,9 @@ class AzureHandler:
         for region in regions:
             results[region.name] = {
                 "description": "Microsoft Azure {}".format(region.display_name),
-                "latitude": region.latitude,
-                "longitude": region.longitude,
+                # NetBox expects 6 decimal points
+                "latitude": "{:.6f}".format(float(region.latitude)),
+                "longitude": "{:.6f}".format(float(region.longitude)),
                 }
         return results
 
@@ -479,7 +482,6 @@ class AzureHandler:
                             )
                         used_regions.append(vm.location)
                     vm_size = vm.hardware_profile.vm_size
-                    vm_cpus = sub_vm_skus[vm_size]["vCPUs"]
                     vm_mem = int(
                         float(sub_vm_skus[vm_size]["MemoryGB"]) * 1024.0
                         )
@@ -495,7 +497,7 @@ class AzureHandler:
                             "site": {"slug": az_slug(vm.location)},
                             "role": {"name": "Server"},
                             "platform": os_type,
-                            "vcpus": vm_cpus,
+                            "vcpus": int(sub_vm_skus[vm_size]["vCPUs"]),
                             "memory": vm_mem,
                             "disk": storage_size,
                             "tags": self.tags,
@@ -503,7 +505,7 @@ class AzureHandler:
                     # Network configuration
                     network_objects = self._get_network_config(vm)
                     for key in network_objects:
-                        results[key].append(network_objects[key])
+                        results[key].extend(network_objects[key])
             except azure_exceptions.CloudError as err:
                 log.warning(
                     "Unable to collect data from subscription ID '%s'. "
@@ -514,14 +516,17 @@ class AzureHandler:
             # relevant regions
             avail_regions = self._get_regions(sub_id)
             for region in used_regions:
-                results["sites"].append(
-                    {
-                        "name": avail_regions[region]["description"],
-                        "slug": az_slug(region),
-                        "latitude": avail_regions[region]["latitude"],
-                        "longitude": avail_regions[region]["longitude"],
-                        "tags": self.tags,
-                    })
+                # We check to make sure the results don't already contain the
+                # site we want to add
+                if not any(site == region for site in results["sites"]):
+                    results["sites"].append(
+                        {
+                            "name": avail_regions[region]["description"],
+                            "slug": az_slug(region),
+                            "latitude": avail_regions[region]["latitude"],
+                            "longitude": avail_regions[region]["longitude"],
+                            "tags": self.tags,
+                        })
         return results
 
 class NetBoxHandler:
@@ -858,11 +863,8 @@ class NetBoxHandler:
                             "IP %s has passed necessary pre-checks.",
                             ip_addr
                             )
-                        # Update IP address to CIDR notation for comparsion
-                        # with existing NetBox objects
-                        obj["address"] = format_ip(ip_addr)
                         # Search for parent prefix to assign VRF and tenancy
-                        prefix = self.search_prefix(obj["address"])
+                        prefix = self.search_prefix(ip_addr)
                         # Update placeholder values with matched values
                         obj["vrf"] = prefix["vrf"]
                         obj["tenant"] = prefix["tenant"]
@@ -936,9 +938,9 @@ class NetBoxHandler:
             # NetBox object types do not have a standard key to search and
             # filter them by therefore we look up the appropriate key
             query_key = self.obj_map[nb_obj_type]["key"]
-            vc_obj_values = [obj[query_key] for obj in az_objects[nb_obj_type]]
+            az_obj_values = [obj[query_key] for obj in az_objects[nb_obj_type]]
             orphans = [
-                obj for obj in nb_objects if obj[query_key] not in vc_obj_values
+                obj for obj in nb_objects if obj[query_key] not in az_obj_values
                 ]
             log.info(
                 "Comparison completed. %s %s orphaned NetBox object%s did not "
