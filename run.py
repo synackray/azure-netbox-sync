@@ -41,6 +41,7 @@ def main():
         else:
             nb = NetBoxHandler()
             nb.verify_dependencies()
+            # TODO: Fix virtual machine mismatch dicts
             nb.sync_objects(az_obj_type="vms")
             nb.sync_objects(az_obj_type="vnets")
             log.info(
@@ -518,7 +519,9 @@ class AzureHandler:
             for region in used_regions:
                 # We check to make sure the results don't already contain the
                 # site we want to add
-                if not any(site == region for site in results["sites"]):
+                if not any(
+                        site["slug"] == az_slug(region)
+                        for site in results["sites"]):
                     results["sites"].append(
                         {
                             "name": avail_regions[region]["description"],
@@ -928,7 +931,7 @@ class NetBoxHandler:
                 )["results"]
             # Issue 33: As of NetBox v2.6.11 it is not possible to filter
             # virtual interfaces by tag. Therefore we filter post collection.
-            if az_obj_type == "virtual_machines" and \
+            if az_obj_type == "vms" and \
                     nb_obj_type == "virtual_interfaces":
                 nb_objects = [
                     obj for obj in nb_objects
@@ -938,7 +941,7 @@ class NetBoxHandler:
                     "Found %s virtual interfaces with tag 'Azure'.",
                     len(nb_objects)
                     )
-            elif az_obj_type == "virtual_machines" and \
+            elif az_obj_type == "vms" and \
                     nb_obj_type == "ip_addresses":
                 nb_objects = [
                     obj for obj in nb_objects
