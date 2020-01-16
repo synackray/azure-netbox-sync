@@ -770,9 +770,18 @@ class NetBoxHandler:
             req_type="get", nb_obj_type=nb_obj_type,
             query=query
             )
+        # Users have the option to avoid updating prefixes that have already
+        # been created by other means.
+        if req["count"] == 1 and nb_obj_type == "prefix" \
+                and not settings.NB_OVERWRITE_PREFIXES:
+            log.info(
+                "NetBox %s object '%s' already exists and overwrite "
+                "prefixes setting is currently False. Skipping update.",
+                nb_obj_type, az_data[query_key]
+                )
         # A single matching object is found so we compare its values to the new
         # object
-        if req["count"] == 1:
+        elif req["count"] == 1:
             log.debug(
                 "NetBox %s object '%s' already exists. Comparing values.",
                 nb_obj_type, az_data[query_key]
@@ -1055,8 +1064,15 @@ class NetBoxHandler:
                 {"name": "Linux", "slug": "linux"},
                 ],
             "cluster_types": [
-                {"name": "VMware ESXi", "slug": "vmware-esxi"}
+                {"name": "Public Cloud", "slug": "public-cloud"}
                 ],
+            "clusters": [
+                {
+                    "name": "Microsoft Azure",
+                    "slug": "microsoft-azure",
+                    "type": {"name": "Public Cloud"},
+                    "tags": ["Synced", "Azure"],
+                }],
             "device_roles": [
                 {
                     "name": "Server",
