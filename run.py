@@ -393,9 +393,6 @@ class AzureHandler:
         for region in regions:
             results[region.name] = {
                 "description": "Microsoft Azure {}".format(region.display_name),
-                # NetBox expects 6 decimal points
-                "latitude": "{:.6f}".format(float(region.latitude)),
-                "longitude": "{:.6f}".format(float(region.longitude)),
                 }
         return results
 
@@ -409,19 +406,23 @@ class AzureHandler:
                 self.credentials, sub_id
                 )
             log.info("Collecting VNETs for Azure Subscription ID '%s'.", sub_id)
+            regions = self._get_regions(sub_id)
             try:
                 for vnet in self.network_client.virtual_networks.list_all():
                     prefix_template = {
                         "prefix": "",
-                        "site": {"slug": vnet.location},
+                        "cluster": {
+                            "name": regions[vnet.location]["description"]
+                            },
                         "description": "",
-                        # VRF and tenant are initialized and will be updated later
+                        # VRF and tenant are initialized to be updated later
                         "vrf": None,
                         "tenant": None,
                         "status": 1,
                         "tags": self.tags,
                         }
                     log.debug("Collecting VNET '%s' address spaces.", vnet.name)
+                    import pdb;pdb.set_trace()
                     for prefix in vnet.address_space.address_prefixes:
                         prefix_template["prefix"] = prefix
                         prefix_template["description"] = vnet.name
@@ -448,7 +449,7 @@ class AzureHandler:
         """Get Azure Virtual Machine information."""
         # Initialize expected result keys
         results = {
-            "sites": [],
+            "clusters": [],
             "virtual_machines": [],
             "virtual_interfaces": [],
             "ip_addresses": []
@@ -464,6 +465,7 @@ class AzureHandler:
             self.compute_client = ComputeManagementClient(
                 self.credentials, sub_id
                 )
+            regions = self._get_regions(sub_id)
             # Some subscriptions are not readable so catch and move on
             try:
                 for vm in self.compute_client.virtual_machines.list_all():
@@ -494,8 +496,9 @@ class AzureHandler:
                         {
                             "name": vm.name,
                             "status": 1,
-                            "cluster": {"name": "Microsoft Azure"},
-                            "site": {"slug": az_slug(vm.location)},
+                            "cluster": {
+                                "name": regions[vm.location]["description"]
+                                },
                             "role": {"name": "Server"},
                             "platform": os_type,
                             "vcpus": int(sub_vm_skus[vm_size]["vCPUs"]),
@@ -513,21 +516,19 @@ class AzureHandler:
                     "Received error '%s: %s'", sub_id, err.error.error,
                     err.message
                     )
-            # Sites are done after virtual machines to ensure we only build
+            # Clusters are done after virtual machines to ensure we only build
             # relevant regions
-            avail_regions = self._get_regions(sub_id)
             for region in used_regions:
                 # We check to make sure the results don't already contain the
                 # site we want to add
                 if not any(
-                        site["slug"] == az_slug(region)
-                        for site in results["sites"]):
-                    results["sites"].append(
+                        cluster["name"] == regions[region]["description"]
+                        for cluster in results["clusters"]):
+                    results["clusters"].append(
                         {
-                            "name": avail_regions[region]["description"],
-                            "slug": az_slug(region),
-                            "latitude": avail_regions[region]["latitude"],
-                            "longitude": avail_regions[region]["longitude"],
+                            "name": regions[region]["description"],
+                            "type": {"name": "Public Cloud"},
+                            "group": {"name": "Microsoft Azure"},
                             "tags": self.tags,
                         })
         return results
@@ -1069,13 +1070,9 @@ class NetBoxHandler:
             "cluster_types": [
                 {"name": "Public Cloud", "slug": "public-cloud"}
                 ],
-            "clusters": [
-                {
-                    "name": "Microsoft Azure",
-                    "slug": "microsoft-azure",
-                    "type": {"name": "Public Cloud"},
-                    "tags": ["Synced", "Azure"],
-                }],
+            "cluster_groups": [
+                {"name": "Microsoft Azure", "slug": "microsoft-azure"}
+                ],
             "device_roles": [
                 {
                     "name": "Server",
