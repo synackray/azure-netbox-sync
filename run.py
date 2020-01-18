@@ -41,7 +41,6 @@ def main():
         else:
             nb = NetBoxHandler()
             nb.verify_dependencies()
-            # TODO: Fix virtual machine mismatch dicts
             nb.sync_objects(az_obj_type="vms")
             nb.sync_objects(az_obj_type="vnets")
             log.info(
@@ -776,7 +775,7 @@ class NetBoxHandler:
             )
         # Users have the option to avoid updating prefixes that have already
         # been created by other means.
-        if req["count"] == 1 and nb_obj_type == "prefix" \
+        if req["count"] == 1 and nb_obj_type == "prefixes" \
                 and not settings.NB_OVERWRITE_PREFIXES:
             log.info(
                 "NetBox %s object '%s' already exists and overwrite "
