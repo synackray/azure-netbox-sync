@@ -165,12 +165,10 @@ def format_tag(tag):
         tag = truncate(tag, max_len=100)
     return tag
 
-def prefix_template(prefix, cluster, description, tags):
+def prefix_template(prefix, description, tags):
+    """A template of the NetBox prefix object used by Azure resources."""
     return {
         "prefix": prefix,
-        "cluster": {
-            "name": cluster
-            },
         "description": description,
         # VRF and tenant are initialized to be updated later
         "vrf": None,
@@ -419,14 +417,12 @@ class AzureHandler:
                 self.credentials, sub_id
                 )
             log.info("Collecting VNETs for Azure Subscription ID '%s'.", sub_id)
-            regions = self._get_regions(sub_id)
             try:
                 for vnet in self.network_client.virtual_networks.list_all():
                     log.debug("Collecting VNET '%s' address spaces.", vnet.name)
                     for prefix in vnet.address_space.address_prefixes:
                         results["prefixes"].append(prefix_template(
                             prefix=prefix,
-                            cluster=regions[vnet.location]["description"],
                             description=vnet.name,
                             tags=self.tags
                             ))
@@ -435,16 +431,12 @@ class AzureHandler:
                             for prefix in subnet.address_prefixes:
                                 results["prefixes"].append(prefix_template(
                                     prefix=prefix.address_prefix,
-                                    cluster=\
-                                        regions[vnet.location]["description"],
                                     description=vnet.name,
                                     tags=self.tags
                                     ))
                         else:
                             results["prefixes"].append(prefix_template(
                                 prefix=subnet.address_prefix,
-                                cluster=\
-                                    regions[vnet.location]["description"],
                                 description=subnet.name,
                                 tags=self.tags
                                 ))
