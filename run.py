@@ -165,6 +165,20 @@ def format_tag(tag):
         tag = truncate(tag, max_len=100)
     return tag
 
+def prefix_template(prefix, cluster, description, tags):
+    return {
+        "prefix": prefix,
+        "cluster": {
+            "name": cluster
+            },
+        "description": description,
+        # VRF and tenant are initialized to be updated later
+        "vrf": None,
+        "tenant": None,
+        "status": 1,
+        "tags": tags,
+        }
+
 def truncate(text="", max_len=50):
     """Ensure a string complies to the maximum length specified."""
     return text if len(text) < max_len else text[:max_len]
@@ -408,34 +422,32 @@ class AzureHandler:
             regions = self._get_regions(sub_id)
             try:
                 for vnet in self.network_client.virtual_networks.list_all():
-                    prefix_template = {
-                        "prefix": "",
-                        "cluster": {
-                            "name": regions[vnet.location]["description"]
-                            },
-                        "description": "",
-                        # VRF and tenant are initialized to be updated later
-                        "vrf": None,
-                        "tenant": None,
-                        "status": 1,
-                        "tags": self.tags,
-                        }
                     log.debug("Collecting VNET '%s' address spaces.", vnet.name)
-                    import pdb;pdb.set_trace()
                     for prefix in vnet.address_space.address_prefixes:
-                        prefix_template["prefix"] = prefix
-                        prefix_template["description"] = vnet.name
-                        results["prefixes"].append(prefix_template)
+                        results["prefixes"].append(prefix_template(
+                            prefix=prefix,
+                            cluster=regions[vnet.location]["description"],
+                            description=vnet.name,
+                            tags=self.tags
+                            ))
                     for subnet in vnet.subnets:
                         if subnet.address_prefixes is not None:
                             for prefix in subnet.address_prefixes:
-                                prefix_template["prefix"] = \
-                                    prefix.address_prefix
-                                results["prefixes"].append(prefix_template)
+                                results["prefixes"].append(prefix_template(
+                                    prefix=prefix.address_prefix,
+                                    cluster=\
+                                        regions[vnet.location]["description"],
+                                    description=vnet.name,
+                                    tags=self.tags
+                                    ))
                         else:
-                            prefix_template["prefix"] = subnet.address_prefix
-                            prefix_template["description"] = subnet.name
-                            results["prefixes"].append(prefix_template)
+                            results["prefixes"].append(prefix_template(
+                                prefix=subnet.address_prefix,
+                                cluster=\
+                                    regions[vnet.location]["description"],
+                                description=subnet.name,
+                                tags=self.tags
+                                ))
             except azure_exceptions.CloudError as err:
                 log.warning(
                     "Unable to collect data from subscription ID '%s'. "
@@ -776,11 +788,12 @@ class NetBoxHandler:
         # Users have the option to avoid updating prefixes that have already
         # been created by other means.
         if req["count"] == 1 and nb_obj_type == "prefixes" \
+                and "Azure" not in req["results"][0]["tags"] \
                 and not settings.NB_OVERWRITE_PREFIXES:
             log.info(
-                "NetBox %s object '%s' already exists and overwrite "
-                "prefixes setting is currently False. Skipping update.",
-                nb_obj_type, az_data[query_key]
+                "NetBox %s object '%s' already exists with no 'Azure' tag and "
+                "the overwrite prefixes setting is currently False. Skipping "
+                "update.", nb_obj_type, az_data[query_key]
                 )
         # A single matching object is found so we compare its values to the new
         # object
