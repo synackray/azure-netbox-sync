@@ -80,7 +80,7 @@ def compare_dicts(dict1, dict2, dict1_name="d1", dict2_name="d2", path=""):
                 "%s and %s contain dictionary. Evaluating.", dict1_path,
                 dict2_path
                 )
-            compare_dicts(
+            result = compare_dicts(
                 dict1[key], dict2[key], dict1_name, dict2_name,
                 path="[{}]".format(key)
                 )
@@ -109,12 +109,12 @@ def compare_dicts(dict1, dict2, dict1_name="d1", dict2_name="d2", path=""):
                 dict1_path, dict1[key], dict2_path, dict2[key]
                 )
             result = False
-        if not result:
-            log.debug(
-                "%s and %s values do not match.", dict1_path, dict2_path
-                )
-        else:
+        if result:
             log.debug("%s and %s values match.", dict1_path, dict2_path)
+        else:
+            log.debug("%s and %s values do not match.", dict1_path, dict2_path)
+            return result
+    log.debug("Final dictionary compare result: %s", result)
     return result
 
 def find_resource_name(resource_id, resource_type):
@@ -807,7 +807,7 @@ class NetBoxHandler:
                     req_type="put", nb_obj_type=nb_obj_type, data=az_data,
                     nb_id=nb_data["id"]
                     )
-            elif compare_dicts(
+            if compare_dicts(
                     az_data, nb_data, dict1_name="az_data",
                     dict2_name="nb_data"):
                 log.info(
