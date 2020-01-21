@@ -169,7 +169,7 @@ def prefix_template(prefix, description, tags):
     """A template of the NetBox prefix object used by Azure resources."""
     return {
         "prefix": prefix,
-        "description": description,
+        "description": truncate(description, max_len=100),
         # VRF and tenant are initialized to be updated later
         "vrf": None,
         "tenant": None,
@@ -198,7 +198,7 @@ def verify_ip(ip_addr):
         # Strict is set to false to allow host address checks
         version = ip_network(ip_addr, strict=False).version
         global_nets = settings.IPV4_ALLOWED if version == 4 \
-                      else settings.IPV6_ALLOWED
+            else settings.IPV6_ALLOWED
         # Check whether the network is within the global allowed networks
         log.debug(
             "Checking whether IP address '%s' is within %s.", ip_addr,
@@ -304,8 +304,8 @@ class AzureHandler:
             nic_mac = nic_conf.mac_address.replace("-", ":")
             results["virtual_interfaces"].append(
                 {
-                    "virtual_machine": {"name": vm.name},
-                    "name": nic_name,
+                    "virtual_machine": {"name": truncate(vm.name, max_len=64)},
+                    "name": truncate(nic_name, max_len=64),
                     "type": 0, # 0 = Virtual
                     "enabled": True,
                     "mac_address": nic_mac.upper(),
@@ -354,7 +354,13 @@ class AzureHandler:
                         resource_group_name=pub_ip_rg,
                         public_ip_address_name=pub_ip_name
                         )
-                    pub_ip_addr = pub_ip.ip_address
+                    if pub_ip.public_ip_prefix is not None:
+                        pub_ip_addr = "{}/{}".format(
+                            pub_ip.ip_address,
+                            pub_ip.public_ip_prefix.split("/")[-1]
+                            )
+                    else:
+                        pub_ip_addr = "{}/32".format(pub_ip.ip_address)
                 # Create records for all IPs found
                 ips = [
                     ip for ip in [priv_ip_addr, pub_ip_addr] if ip is not None
@@ -367,9 +373,9 @@ class AzureHandler:
                             "tenant": None,
                             "interface": {
                                 "virtual_machine": {
-                                    "name": vm.name
+                                    "name": truncate(vm.name, max_len=64)
                                     },
-                                "name": nic_name,
+                                "name": truncate(nic_name, max_len=64),
                                 },
                             "tags": self.tags,
                         })
@@ -423,7 +429,7 @@ class AzureHandler:
                     for prefix in vnet.address_space.address_prefixes:
                         results["prefixes"].append(prefix_template(
                             prefix=prefix,
-                            description=vnet.name,
+                            description=truncate(vnet.name, max_len=100),
                             tags=self.tags
                             ))
                     for subnet in vnet.subnets:
@@ -431,13 +437,13 @@ class AzureHandler:
                             for prefix in subnet.address_prefixes:
                                 results["prefixes"].append(prefix_template(
                                     prefix=prefix.address_prefix,
-                                    description=vnet.name,
+                                    description=truncate(vnet.name, max_len=100),
                                     tags=self.tags
                                     ))
                         else:
                             results["prefixes"].append(prefix_template(
                                 prefix=subnet.address_prefix,
-                                description=subnet.name,
+                                description=truncate(subnet.name, max_len=100),
                                 tags=self.tags
                                 ))
             except azure_exceptions.CloudError as err:
@@ -497,7 +503,7 @@ class AzureHandler:
                     storage_size = self._get_storage(vm)
                     results["virtual_machines"].append(
                         {
-                            "name": vm.name,
+                            "name": truncate(vm.name, max_len=64),
                             "status": 1,
                             "cluster": {
                                 "name": regions[vm.location]["description"]
@@ -807,7 +813,7 @@ class NetBoxHandler:
                     req_type="put", nb_obj_type=nb_obj_type, data=az_data,
                     nb_id=nb_data["id"]
                     )
-            if compare_dicts(
+            elif compare_dicts(
                     az_data, nb_data, dict1_name="az_data",
                     dict2_name="nb_data"):
                 log.info(
