@@ -28,26 +28,28 @@ def main():
              "settings file. Intended for debugging purposes only."
         )
     args = parser.parse_args()
+    nb = NetBoxHandler()
     if args.verbose:
         log.setLevel("DEBUG")
         log.debug("Log level has been overriden by the --verbose argument.")
         start_time = datetime.now()
         if args.cleanup:
+            nb.remove_all()
             log.info(
                 "Completed removal of Azure tenant ID '%s' objects. Total "
                 "execution time %s.",
                 settings.AZURE_TENANT_ID, (datetime.now() - start_time)
                 )
-        else:
-            nb = NetBoxHandler()
-            nb.verify_dependencies()
-            nb.sync_objects(az_obj_type="vms")
-            nb.sync_objects(az_obj_type="vnets")
-            log.info(
-                "Completed sync with Azure tenant ID '%s'! Total "
-                "execution time %s.", settings.AZURE_TENANT_ID,
-                (datetime.now() - start_time)
-                )
+    else:
+        start_time = datetime.now()
+        nb.verify_dependencies()
+        nb.sync_objects(az_obj_type="vms")
+        nb.sync_objects(az_obj_type="vnets")
+        log.info(
+            "Completed sync with Azure tenant ID '%s'! Total "
+            "execution time %s.", settings.AZURE_TENANT_ID,
+            (datetime.now() - start_time)
+            )
 
 def az_slug(text):
     """
