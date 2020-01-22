@@ -303,6 +303,7 @@ class AzureHandler:
                 resource_group_name=nic_rg,
                 network_interface_name=nic_name
                 )
+            log.debug("Collecting VM '%s' VNIC '%s' data.", vm.name, nic_name)
             nic_mac = nic_conf.mac_address.replace("-", ":")
             results["virtual_interfaces"].append(
                 {
@@ -381,7 +382,7 @@ class AzureHandler:
                                 },
                             "tags": self.tags,
                         })
-                return results
+        return results
 
     def get_subscriptions(self):
         """
