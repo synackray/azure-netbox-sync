@@ -882,8 +882,11 @@ class NetBoxHandler:
             for obj in az_objects[nb_obj_type]:
                 # Check to ensure IP addresses pass all checks before syncing
                 # to NetBox
-                if nb_obj_type == "ip_addresses":
-                    ip_addr = obj["address"]
+                if nb_obj_type in ["ip_addresses", "prefixes"]:
+                    ip_addr = (
+                        obj["address"] if nb_obj_type == "ip_addresses"
+                        else obj["prefix"] if nb_obj_type == "prefixes" else ""
+                        )
                     if verify_ip(ip_addr):
                         log.debug(
                             "IP %s has passed necessary pre-checks.",
