@@ -6,7 +6,7 @@ azure-mgmt-resource==7.0.0
 certifi==2019.11.28
 cffi==1.13.2
 chardet==3.0.4
-cryptography==2.8
+cryptography==3.2
 idna==2.8
 isodate==0.6.0
 msrest==0.6.10
